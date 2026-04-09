@@ -69,27 +69,87 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     Exits with an error message on invalid input.
     """
-    # build the parser
-    # parse argv (uses sys.argv[1:] if None)
-    # the positional REMAINDER captures the downstream spec: the first arg
-    #   without a leading "-" and everything after it
-    # if no positional args: error ("no downstream specified")
-    # auto-detect: if exactly one positional arg starting with "http:" or "https:",
-    #   treat it as a URL; otherwise treat all positional args as a command
-    # validate: --idle-timeout > 0 and --reconnect-immediately together is an error
-    # warn to stderr if --backoff-max given without --reconnect-immediately
-    # warn to stderr if --idle-client-only given without --idle-timeout > 0
-    # construct and return a frozen Config from the parsed namespace
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    downstream: list[str] = args.downstream
+    # Strip a leading "--" if the user passes one out of habit.
+    if downstream and downstream[0] == "--":
+        downstream = downstream[1:]
+
+    if not downstream:
+        parser.error("no downstream server specified")
+
+    # Auto-detect URL vs command.
+    url: str | None = None
+    command: list[str] | None = None
+    if len(downstream) == 1 and (
+        downstream[0].startswith("http://") or downstream[0].startswith("https://")
+    ):
+        url = downstream[0]
+    else:
+        command = downstream
+
+    # Mutual exclusion.
+    if args.idle_timeout > 0 and args.reconnect_immediately:
+        parser.error("--idle-timeout and --reconnect-immediately are mutually exclusive")
+
+    # Warnings for likely-unintentional flag combos.
+    if args.backoff_max != _DEFAULTS["backoff_max"] and not args.reconnect_immediately:
+        print(
+            "warning: --backoff-max has no effect without --reconnect-immediately",
+            file=sys.stderr,
+        )
+    if args.idle_client_only and args.idle_timeout <= 0:
+        print(
+            "warning: --idle-client-only has no effect without --idle-timeout",
+            file=sys.stderr,
+        )
+
+    return Config(
+        command=command,
+        url=url,
+        reconnect_immediately=args.reconnect_immediately,
+        backoff=BackoffConfig(max=args.backoff_max),
+        idle=IdleConfig(timeout=args.idle_timeout, client_only=args.idle_client_only),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
     """Construct the ArgumentParser without executing a parse."""
-    # create ArgumentParser with prog="immortal-mcp" and appropriate description
-    # add --reconnect-immediately flag (store_true)
-    # add --backoff-max argument (float, default from _DEFAULTS)
-    # add --idle-timeout argument (float, default from _DEFAULTS)
-    # add --idle-client-only flag (store_true)
-    # add positional "downstream" (nargs=REMAINDER): the first non-flag arg
-    #   and everything after it becomes the downstream spec.
-    #   Auto-detected as URL or command by parse_args.
-    # return parser
+    parser = argparse.ArgumentParser(
+        prog="immortal-mcp",
+        description="Resilient MCP proxy with automatic reconnection",
+    )
+    parser.add_argument(
+        "--reconnect-immediately",
+        action="store_true",
+        default=False,
+        help="Reconnect to downstream immediately on disconnect (default: on-demand)",
+    )
+    parser.add_argument(
+        "--backoff-max",
+        type=float,
+        default=_DEFAULTS["backoff_max"],
+        metavar="SECS",
+        help=f"Maximum backoff delay in seconds (default: {_DEFAULTS['backoff_max']})",
+    )
+    parser.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=_DEFAULTS["idle_timeout"],
+        metavar="SECS",
+        help="Disconnect downstream after N seconds of inactivity; 0 disables (default: 0)",
+    )
+    parser.add_argument(
+        "--idle-client-only",
+        action="store_true",
+        default=False,
+        help="Only client→downstream messages count as activity",
+    )
+    parser.add_argument(
+        "downstream",
+        nargs=argparse.REMAINDER,
+        help="Downstream server: command [args...] or URL",
+    )
+    return parser

@@ -11,16 +11,23 @@ interpret MCP semantics beyond the initialization handshake.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 
+import anyio
 import mcp.types as types
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
+from mcp.client.sse import sse_client
+from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.message import SessionMessage
 
 from .cli import Config
 from .idle import IdleTracker
 
+logger = logging.getLogger(__name__)
 
 # JSON-RPC error code for internal/unexpected errors.
 _JSONRPC_INTERNAL_ERROR = -32603
@@ -38,28 +45,44 @@ INFLIGHT_DISCONNECT_ERROR_MESSAGE = (
     "but the response was lost."
 )
 
+_METHOD_PING = "ping"
+
+_LOGGER_NAME = "immortal-mcp"
+
 
 @dataclass
 class _PendingRequest:
     """Tracks a single in-flight request awaiting a downstream response."""
 
     future: asyncio.Future[types.JSONRPCResponse | types.JSONRPCError]
-    """Resolved with the downstream response or rejected on disconnect."""
+
+
+def _make_error(
+    request_id: types.RequestId, message: str
+) -> types.JSONRPCError:
+    return types.JSONRPCError(
+        jsonrpc="2.0",
+        id=request_id,
+        error=types.ErrorData(code=_JSONRPC_INTERNAL_ERROR, message=message),
+    )
+
+
+def _make_log_notification(
+    level: str, data: str
+) -> types.JSONRPCNotification:
+    return types.JSONRPCNotification(
+        method="notifications/message",
+        jsonrpc="2.0",
+        params={"level": level, "logger": _LOGGER_NAME, "data": data},
+    )
+
+
+def _make_list_changed_notification(method: str) -> types.JSONRPCNotification:
+    return types.JSONRPCNotification(method=method, jsonrpc="2.0")
 
 
 class DownstreamManager:
     """Manages the downstream MCP server connection and reconnection logic.
-
-    Responsibilities:
-    - Open and close the downstream transport (subprocess or HTTP).
-    - Replay the MCP initialization handshake after each (re)connect.
-    - Route outbound requests to the downstream and match inbound responses
-      back to their waiting callers via request ID.
-    - Fail all in-flight requests when the downstream disconnects.
-    - Implement the configured reconnect policy (immediate with backoff,
-      or on-demand).
-    - Notify the proxy of downstream-originated notifications so they can
-      be forwarded to the client.
 
     Thread-safety: all methods must be called from the same asyncio event loop.
     """
@@ -70,29 +93,24 @@ class DownstreamManager:
         on_notification: Callable[[types.JSONRPCNotification], None],
         idle_tracker: IdleTracker,
     ) -> None:
-        """
-        Args:
-            config: Resolved proxy configuration.
-            on_notification: Called with each notification received from the
-                downstream server.  Must not block.
-            idle_tracker: Shared idle tracker; downstream manager records
-                DOWNSTREAM activity on each received message.
-        """
-        # store config, on_notification, idle_tracker on self
-        # set _write_stream to None  (open downstream write stream, or None if disconnected)
-        # set _reader_task_handle to None  (asyncio.Task running _reader_task, or None)
-        # set _pending: dict[RequestId, _PendingRequest] = {}  (in-flight requests)
-        # set _handshake to None  (cached tuple of (init_req, init_resp, initialized_notif))
-        # set _transport_exit_stack to None  (AsyncExitStack owning the transport context manager)
-        # set _reconnect_task to None  (asyncio.Task running _reconnect_loop, or None)
-        # set _was_connected to False  (True after the first successful connect;
-        #                               used to distinguish reconnect from initial connect
-        #                               for notification purposes)
-        # set downstream_capabilities to {}  (dict: cached capabilities from the
-        #                                     downstream's initialize result; e.g.
-        #                                     {"tools": {}, "resources": {"subscribe": true}}.
-        #                                     Absence of a key means the downstream
-        #                                     does not support that capability.)
+        self._config = config
+        self._on_notification = on_notification
+        self._idle_tracker = idle_tracker
+
+        self._write_stream: MemoryObjectSendStream[SessionMessage] | None = None
+        self._read_stream: MemoryObjectReceiveStream[SessionMessage | Exception] | None = None
+        self._reader_task_handle: asyncio.Task[None] | None = None
+        self._pending: dict[types.RequestId, _PendingRequest] = {}
+        self._handshake: tuple[
+            types.JSONRPCRequest,
+            types.JSONRPCResponse,
+            types.JSONRPCNotification,
+        ] | None = None
+        self._transport_stack: AsyncExitStack | None = None
+        self._reconnect_task: asyncio.Task[None] | None = None
+        self._was_connected = False
+        self._explicit_disconnect = False
+        self.downstream_capabilities: dict = {}
 
     # ------------------------------------------------------------------
     # Handshake cache
@@ -104,60 +122,150 @@ class DownstreamManager:
         initialize_response: types.JSONRPCResponse,
         initialized_notification: types.JSONRPCNotification,
     ) -> None:
-        """Cache the client's MCP initialization handshake for replay on reconnect.
-
-        Must be called before the first connect() or before any reconnect.
-        Subsequent calls overwrite the previously cached handshake.
-        """
-        # store (initialize_request, initialize_response, initialized_notification) in _handshake
+        self._handshake = (initialize_request, initialize_response, initialized_notification)
 
     # ------------------------------------------------------------------
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> None:
-        """Open the downstream transport and replay the cached handshake.
+    async def initial_connect(
+        self, request: types.JSONRPCRequest
+    ) -> types.JSONRPCResponse:
+        """Connect to the downstream for the first time, retrying with backoff.
 
-        Raises RuntimeError if the handshake has not been set yet.
-        Raises an appropriate exception if the transport cannot be opened.
+        Sends the client's `initialize` request, reads the response, sends
+        `initialized`, starts the reader task, and returns the raw response.
+        Retries indefinitely until the downstream responds.
 
-        After a successful connect, spawns a background reader task that
-        dispatches inbound messages to pending-request futures or the
-        notification callback.
+        After this call, set_handshake() has been called internally and the
+        manager is connected with the reader task running.
         """
-        # if _handshake is None: raise RuntimeError("handshake not set")
-        # open transport: (read_stream, write_stream) = await _open_transport()
-        # store write_stream on self as _write_stream
-        # replay handshake: await _replay_handshake(write_stream, read_stream)
-        #   (also updates downstream_capabilities from the handshake response)
-        # spawn _reader_task as an asyncio.Task, store in _reader_task_handle
-        # if _was_connected:
-        #   send reconnect notification via on_notification (notifications/message, info)
-        #   send notifications/tools/list_changed via on_notification
-        #   send notifications/prompts/list_changed via on_notification
-        #   send notifications/resources/list_changed via on_notification
-        # set _was_connected to True
+        attempt = 0
+        while True:
+            delay = self._compute_backoff_delay(attempt)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                read_stream, write_stream = await self._open_transport()
+                await write_stream.send(SessionMessage(request))
+                response: types.JSONRPCResponse | None = None
+                async for item in read_stream:
+                    if isinstance(item, Exception):
+                        raise item
+                    msg = item.message
+                    if isinstance(msg, (types.JSONRPCResponse, types.JSONRPCError)):
+                        if msg.id == request.id:
+                            if isinstance(msg, types.JSONRPCError):
+                                raise RuntimeError(
+                                    f"Downstream initialize failed: {msg.error.message}"
+                                )
+                            response = msg
+                            break
+                if response is None:
+                    raise RuntimeError("Downstream closed before initialize response")
+
+                result = response.result if isinstance(response.result, dict) else {}
+                self.downstream_capabilities = result.get("capabilities", {})
+
+                initialized_notif = types.JSONRPCNotification(
+                    method="notifications/initialized", jsonrpc="2.0"
+                )
+                await write_stream.send(SessionMessage(initialized_notif))
+
+                self.set_handshake(request, response, initialized_notif)
+                self._write_stream = write_stream
+                self._read_stream = read_stream
+                self._explicit_disconnect = False
+                self._reader_task_handle = asyncio.create_task(
+                    self._reader_task(read_stream)
+                )
+                self._was_connected = True
+                return response
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if self._transport_stack is not None:
+                    try:
+                        await self._transport_stack.aclose()
+                    except Exception:
+                        pass
+                    self._transport_stack = None
+                attempt += 1
+
+    async def connect(self) -> None:
+        """Open the downstream transport and replay the cached handshake."""
+        if self._handshake is None:
+            raise RuntimeError("handshake not set")
+
+        read_stream, write_stream = await self._open_transport()
+        self._write_stream = write_stream
+        self._read_stream = read_stream
+
+        await self._replay_handshake(write_stream, read_stream)
+
+        self._explicit_disconnect = False
+        self._reader_task_handle = asyncio.create_task(self._reader_task(read_stream))
+
+        if self._was_connected:
+            self._on_notification(
+                _make_log_notification("info", "Downstream server connection restored")
+            )
+            for method in (
+                "notifications/tools/list_changed",
+                "notifications/prompts/list_changed",
+                "notifications/resources/list_changed",
+            ):
+                self._on_notification(_make_list_changed_notification(method))
+
+        self._was_connected = True
 
     async def disconnect(self) -> None:
-        """Close the downstream transport and cancel the reader task.
+        """Close the downstream transport and cancel the reader task."""
+        if self._write_stream is None and self._reader_task_handle is None:
+            return
 
-        All in-flight requests are failed with DISCONNECT_ERROR_MESSAGE.
-        Idempotent: calling disconnect() when already disconnected is a no-op.
-        """
-        # if _write_stream is None and _reader_task_handle is None: return  (already disconnected)
-        # cancel and await _reconnect_task if running, set to None
-        # cancel and await _reader_task_handle if not None, set to None
-        # set _write_stream to None
-        # close the transport via _transport_exit_stack if not None, set to None
-        # call _fail_pending_requests()
-        # if _was_connected:
-        #   send idle-disconnect notification via on_notification
-        #   (notifications/message, level=info, "Downstream server disconnected due to inactivity")
+        self._explicit_disconnect = True
+
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self._reconnect_task = None
+
+        if self._reader_task_handle is not None and not self._reader_task_handle.done():
+            self._reader_task_handle.cancel()
+            try:
+                await self._reader_task_handle
+            except asyncio.CancelledError:
+                pass
+        self._reader_task_handle = None
+
+        self._write_stream = None
+        self._read_stream = None
+
+        if self._transport_stack is not None:
+            await self._transport_stack.aclose()
+            self._transport_stack = None
+
+        self._fail_pending_requests()
+
+        if self._was_connected:
+            self._on_notification(
+                _make_log_notification(
+                    "info", "Downstream server disconnected due to inactivity"
+                )
+            )
 
     @property
     def is_connected(self) -> bool:
-        """True when the downstream transport is open and the reader is running."""
-        # return _write_stream is not None and _reader_task_handle is not None and not done
+        return (
+            self._write_stream is not None
+            and self._reader_task_handle is not None
+            and not self._reader_task_handle.done()
+        )
 
     # ------------------------------------------------------------------
     # Message sending
@@ -166,36 +274,37 @@ class DownstreamManager:
     async def send_request(
         self, request: types.JSONRPCRequest
     ) -> types.JSONRPCResponse | types.JSONRPCError:
-        """Send a request to the downstream and return its response.
+        if not self.is_connected:
+            if request.method == _METHOD_PING:
+                return types.JSONRPCResponse(
+                    jsonrpc="2.0", id=request.id, result={}
+                )
+            if self._config.reconnect_immediately:
+                return _make_error(request.id, NOT_CONNECTED_ERROR_MESSAGE)
+            # On-demand: attempt to connect first.
+            try:
+                await self.connect()
+            except Exception:
+                return _make_error(request.id, NOT_CONNECTED_ERROR_MESSAGE)
 
-        If not connected and reconnect mode is on-demand, attempts to connect
-        first.  If the connection attempt fails, returns a JSONRPCError.
-
-        If not connected and reconnect mode is immediate (background reconnect
-        is in progress), returns a JSONRPCError immediately without waiting.
-
-        If the downstream disconnects while the request is in flight, the
-        returned future is resolved with a JSONRPCError.
-        """
-        # if not connected:
-        #   if request.method == "ping": return a pong response immediately
-        #     (ping must not trigger a connect; respond locally instead)
-        #   if reconnect_immediately: return _make_not_connected_error(request.id)
-        #   else (on-demand):
-        #     try: await connect()
-        #     except Exception: return _make_not_connected_error(request.id)
-        # create asyncio.Future, store in _pending[request.id] as _PendingRequest
-        # send SessionMessage(request) to _write_stream
-        # await the future and return its result
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[types.JSONRPCResponse | types.JSONRPCError] = loop.create_future()
+        self._pending[request.id] = _PendingRequest(future=future)
+        try:
+            await self._write_stream.send(SessionMessage(request))
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+            self._pending.pop(request.id, None)
+            if not future.done():
+                future.set_result(_make_error(request.id, INFLIGHT_DISCONNECT_ERROR_MESSAGE))
+        return await future
 
     async def send_notification(self, notification: types.JSONRPCNotification) -> None:
-        """Send a notification to the downstream.
-
-        Silently drops the notification if the downstream is not connected,
-        as notifications have no response to fail.
-        """
-        # if not connected: return
-        # send SessionMessage(notification) to _write_stream
+        if not self.is_connected:
+            return
+        try:
+            await self._write_stream.send(SessionMessage(notification))
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+            pass
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -207,109 +316,137 @@ class DownstreamManager:
         MemoryObjectReceiveStream[SessionMessage | Exception],
         MemoryObjectSendStream[SessionMessage],
     ]:
-        """Open the appropriate downstream transport based on config.
+        stack = AsyncExitStack()
+        await stack.__aenter__()
+        try:
+            if self._config.command is not None:
+                params = StdioServerParameters(
+                    command=self._config.command[0],
+                    args=self._config.command[1:],
+                )
+                read_stream, write_stream = await stack.enter_async_context(
+                    stdio_client(params)
+                )
+            else:
+                url = self._config.url
+                try:
+                    read_stream, write_stream, _ = await stack.enter_async_context(
+                        streamablehttp_client(url)
+                    )
+                except Exception:
+                    # Fall back to SSE transport.
+                    await stack.aclose()
+                    stack = AsyncExitStack()
+                    await stack.__aenter__()
+                    read_stream, write_stream = await stack.enter_async_context(
+                        sse_client(url)
+                    )
+        except Exception:
+            await stack.aclose()
+            raise
 
-        Returns a (read_stream, write_stream) pair.
-        The async context manager that owns the transport lifetime is stored on
-        self so that disconnect() can close it.
-        """
-        # create a new AsyncExitStack and enter it, storing it as _transport_exit_stack
-        # if config.command is not None:
-        #   build StdioServerParameters(command=config.command[0], args=config.command[1:])
-        #   enter stdio_client(params) context via the stack
-        # else (HTTP):
-        #   enter streamablehttp_client(config.url) context via the stack;
-        #   if that fails with a transport error, fall back to sse_client(config.url)
-        # return (read_stream, write_stream) from the entered context
+        self._transport_stack = stack
+        return read_stream, write_stream
 
     async def _replay_handshake(
         self,
         write_stream: MemoryObjectSendStream[SessionMessage],
         read_stream: MemoryObjectReceiveStream[SessionMessage | Exception],
     ) -> None:
-        """Replay the cached initialization handshake to the downstream.
+        init_req, _, initialized_notif = self._handshake
 
-        Sends `initialize` (with a proxy-generated request ID), awaits the
-        response, then sends `initialized`.  The downstream's response is
-        discarded; the client already has its own cached response.
-        """
-        # unpack _handshake into (init_req, _, initialized_notif)
-        # build a new JSONRPCRequest with method="initialize", same params as init_req,
-        #   but with a proxy-generated id (e.g. "proxy-init") to avoid collision
-        # send SessionMessage(new_init_req) to write_stream
-        # read messages from read_stream until a JSONRPCResponse or JSONRPCError
-        #   matching our proxy id is received (discard other messages)
-        # cache downstream_capabilities from the response result["capabilities"]
-        # send SessionMessage(initialized_notif) to write_stream
+        proxy_init = types.JSONRPCRequest(
+            method="initialize",
+            params=init_req.params,
+            id="proxy-init",
+            jsonrpc="2.0",
+        )
+        await write_stream.send(SessionMessage(proxy_init))
+
+        async for item in read_stream:
+            if isinstance(item, Exception):
+                raise item
+            msg = item.message
+            if isinstance(msg, (types.JSONRPCResponse, types.JSONRPCError)) and msg.id == "proxy-init":
+                if isinstance(msg, types.JSONRPCError):
+                    raise RuntimeError(f"Downstream initialize failed: {msg.error.message}")
+                result = msg.result if isinstance(msg.result, dict) else {}
+                self.downstream_capabilities = result.get("capabilities", {})
+                break
+
+        await write_stream.send(SessionMessage(initialized_notif))
 
     async def _reader_task(
         self,
         read_stream: MemoryObjectReceiveStream[SessionMessage | Exception],
     ) -> None:
-        """Background task: read messages from downstream and dispatch them.
+        try:
+            async for item in read_stream:
+                if isinstance(item, Exception):
+                    raise item
 
-        Responses (JSONRPCResponse / JSONRPCError) are matched to pending
-        request futures by ID.  Notifications (JSONRPCNotification) are
-        forwarded to the on_notification callback.
+                msg = item.message
 
-        Terminates when the stream ends or raises, triggering disconnect
-        cleanup and (if configured) the immediate-reconnect loop.
-        """
-        # try:
-        #   async for session_message in read_stream:
-        #     if session_message is an Exception: raise it (propagate transport errors)
-        #     record DOWNSTREAM activity on idle_tracker for non-ping messages
-        #     unwrap: message = session_message.message
-        #     if message is JSONRPCResponse or JSONRPCError:
-        #       if message.id in _pending: resolve the future with message; remove from _pending
-        #       else: log/discard (unexpected response id)
-        #     elif message is JSONRPCNotification:
-        #       call on_notification(message)
-        #     else: discard (JSONRPCRequest from downstream is unexpected)
-        # except (anyio.ClosedResourceError, Exception):
-        #   pass  (stream ended or transport error)
-        # finally:
-        #   set _write_stream to None
-        #   set _reader_task_handle to None
-        #   call _fail_pending_requests()
-        #   send disconnect notification via on_notification (notifications/message, warning)
-        #   if config.reconnect_immediately:
-        #     spawn _reconnect_loop() as asyncio.Task, store in _reconnect_task
+                if hasattr(msg, "method") and getattr(msg, "method", None) != _METHOD_PING:
+                    from .idle import ActivitySource
+                    self._idle_tracker.record_activity(ActivitySource.DOWNSTREAM)
+
+                if isinstance(msg, (types.JSONRPCResponse, types.JSONRPCError)):
+                    pending = self._pending.pop(msg.id, None)
+                    if pending is not None and not pending.future.done():
+                        pending.future.set_result(msg)
+                elif isinstance(msg, types.JSONRPCNotification):
+                    self._on_notification(msg)
+        except (anyio.ClosedResourceError, anyio.EndOfStream):
+            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Reader task error", exc_info=True)
+        finally:
+            self._write_stream = None
+            self._reader_task_handle = None
+
+            if self._transport_stack is not None:
+                try:
+                    await self._transport_stack.aclose()
+                except Exception:
+                    pass
+                self._transport_stack = None
+
+            self._fail_pending_requests()
+
+            if not self._explicit_disconnect:
+                self._on_notification(
+                    _make_log_notification("warning", "Downstream server connection lost")
+                )
+
+            if self._config.reconnect_immediately and not self._explicit_disconnect:
+                self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     def _fail_pending_requests(self) -> None:
-        """Resolve all in-flight request futures with a disconnect error.
-
-        Called when the downstream disconnects unexpectedly.
-        """
-        # for each (id, pending) in _pending.items():
-        #   if not pending.future.done():
-        #     pending.future.set_result(_make_inflight_error(id))
-        # clear _pending
+        for req_id, pending in self._pending.items():
+            if not pending.future.done():
+                pending.future.set_result(
+                    _make_error(req_id, INFLIGHT_DISCONNECT_ERROR_MESSAGE)
+                )
+        self._pending.clear()
 
     async def _reconnect_loop(self) -> None:
-        """Background task: repeatedly attempt to reconnect with exponential backoff.
-
-        Only runs in immediate-reconnect mode.  Stops when a connection
-        succeeds or when disconnect() is called explicitly (e.g. idle timeout).
-        """
-        # attempt = 0
-        # loop:
-        #   delay = _compute_backoff_delay(attempt)
-        #   if delay > 0: await asyncio.sleep(delay)
-        #   try:
-        #     await connect()
-        #     return  (success — normal forwarding resumes via _reader_task)
-        #   except asyncio.CancelledError: raise  (disconnect() was called)
-        #   except Exception:
-        #     attempt += 1
-        #     (loop again with increased delay)
+        attempt = 0
+        while True:
+            delay = self._compute_backoff_delay(attempt)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                await self.connect()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                attempt += 1
 
     def _compute_backoff_delay(self, attempt: int) -> float:
-        """Return the backoff delay in seconds for the given attempt number.
-
-        Attempt 0 returns 0 (first reconnect is always immediate).
-        Attempt N > 0 returns min(3^(N-1), config.backoff.max).
-        Sequence after the first attempt: 1, 3, 9, 27, 81, … seconds.
-        """
-        # if attempt == 0: return 0.0
-        # return min(3 ** (attempt - 1), config.backoff.max)
+        if attempt == 0:
+            return 0.0
+        return min(3 ** (attempt - 1), self._config.backoff.max)

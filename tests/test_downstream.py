@@ -442,8 +442,8 @@ async def test_downstream_notifications_forwarded():
                 tg.start_soon(mgr.connect)
                 tg.start_soon(server_side)
 
-    assert len(notifications) == 1
-    assert notifications[0].method == "notifications/tools/list_changed"
+    tools_changed = [n for n in notifications if n.method == "notifications/tools/list_changed"]
+    assert len(tools_changed) == 1
 
 
 async def test_send_notification_dropped_when_disconnected():
@@ -569,50 +569,43 @@ async def test_reconnect_sends_list_changed_notifications():
         initialized_notification=make_initialized_notification(),
     )
 
-    connect_count = 0
-    manager_reads = manager_writes = inject = observe = None
-
-    def make_streams():
-        nonlocal manager_reads, manager_writes, inject, observe
-        manager_reads, manager_writes, inject, observe = _make_in_memory_transport()
+    # Each call to _open_transport creates a fresh stream pair.
+    # We keep a queue of (inject, observe) pairs so the test can respond
+    # to each handshake in sequence.
+    stream_pairs: asyncio.Queue[tuple] = asyncio.Queue()
 
     async def fake_open_transport():
-        nonlocal connect_count
-        connect_count += 1
-        make_streams()
-        return manager_reads, manager_writes
+        mr, mw, inj, obs = _make_in_memory_transport()
+        await stream_pairs.put((inj, obs))
+        return mr, mw
+
+    async def reply_to_handshake(inj, obs):
+        sm: SessionMessage = await obs.receive()
+        await inj.send(SessionMessage(
+            types.JSONRPCResponse(id=sm.message.id, result={}, jsonrpc="2.0")
+        ))
+        await obs.receive()  # initialized
 
     with patch.object(mgr, "_open_transport", side_effect=fake_open_transport):
         # First connection.
-        make_streams()
+        connect_task = asyncio.create_task(mgr.connect())
+        inj1, obs1 = await asyncio.wait_for(stream_pairs.get(), timeout=5)
+        await reply_to_handshake(inj1, obs1)
+        await asyncio.wait_for(connect_task, timeout=5)
 
-        async def first_server():
-            sm: SessionMessage = await observe.receive()
-            await inject.send(SessionMessage(
-                types.JSONRPCResponse(id=sm.message.id, result={}, jsonrpc="2.0")
-            ))
-            await observe.receive()  # initialized
-            # Crash — triggers reconnect.
-            await inject.aclose()
+        # Crash — triggers reconnect loop.
+        await inj1.aclose()
 
-        with anyio.fail_after(5):
-            async with anyio.create_task_group() as tg:
-                tg.start_soon(mgr.connect)
-                tg.start_soon(first_server)
+        # The reconnect loop will call connect() → _open_transport() again.
+        # Reply to the second handshake.
+        inj2, obs2 = await asyncio.wait_for(stream_pairs.get(), timeout=5)
+        await reply_to_handshake(inj2, obs2)
 
-        # After reconnect succeeds, wait for list_changed notifications.
-        # The _reconnect_loop will call connect() which calls fake_open_transport again.
-        # We need a second server to reply to the second handshake.
-        async def second_server():
-            sm: SessionMessage = await observe.receive()
-            await inject.send(SessionMessage(
-                types.JSONRPCResponse(id=sm.message.id, result={}, jsonrpc="2.0")
-            ))
-            await observe.receive()  # initialized
+        # Wait for list_changed notifications.
+        await asyncio.wait_for(list_changed_received.wait(), timeout=5)
 
-        with anyio.fail_after(10):
-            # Wait for the reconnect loop to fire.
-            await list_changed_received.wait()
+        # Clean up.
+        await mgr.disconnect()
 
     received_methods = {n.method for n in notifications}
     assert expected_methods <= received_methods

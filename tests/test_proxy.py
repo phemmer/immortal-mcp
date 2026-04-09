@@ -72,33 +72,31 @@ async def test_initialize_connects_downstream_and_returns_response():
 
     client_read, client_write, inject, observe = _make_streams()
 
-    # Build a mock DownstreamManager.
     mock_downstream = AsyncMock()
     mock_downstream.is_connected = False
     init_response = make_initialize_response()
-    mock_downstream.send_request = AsyncMock(return_value=init_response)
-    mock_downstream.set_handshake = MagicMock()
+    mock_downstream.initial_connect = AsyncMock(return_value=init_response)
+    mock_downstream.downstream_capabilities = {"tools": {}}
 
     init_req = make_initialize_request()
     await inject.send(session(init_req))
-    # Close inject so the client reader stops after one message.
     await inject.aclose()
 
-    with patch(
-        "immortal_mcp.proxy.DownstreamManager", return_value=mock_downstream
-    ):
-        await proxy._handle_client_messages(
-            read_stream=client_read,
-            write_stream=client_write,
-            downstream=mock_downstream,
-            idle_tracker=MagicMock(enabled=False),
-        )
+    await proxy._handle_client_messages(
+        read_stream=client_read,
+        write_stream=client_write,
+        downstream=mock_downstream,
+        idle_tracker=MagicMock(enabled=False),
+    )
 
-    # The response sent to the client should match the downstream response.
     with anyio.fail_after(5):
         sm: SessionMessage = await observe.receive()
     assert isinstance(sm.message, types.JSONRPCResponse)
     assert sm.message.id == init_req.id
+    # Capabilities should have been injected.
+    caps = sm.message.result.get("capabilities", {})
+    assert caps.get("tools", {}).get("listChanged") is True
+    assert caps.get("prompts", {}).get("listChanged") is True
 
 
 async def test_initialized_notification_forwarded_to_downstream():
@@ -298,31 +296,44 @@ def test_is_unsupported_list_method_true_when_absent():
 
 
 async def test_initialize_retries_until_backend_available():
-    """_handle_initialize retries with backoff when the downstream is initially down."""
+    """initial_connect retries with backoff when the downstream is initially down.
+
+    This tests DownstreamManager.initial_connect directly since the retry
+    logic lives there, not in ProxyServer._handle_initialize.
+    """
+    from immortal_mcp.downstream import DownstreamManager
+    from immortal_mcp.idle import IdleTracker
+
     config = _make_config()
-    proxy = ProxyServer(config)
-    _, client_write, _, observe = _make_streams()
+    tracker = IdleTracker(timeout=0, client_only=False, on_idle=lambda: None)
+    mgr = DownstreamManager(config=config, on_notification=lambda n: None, idle_tracker=tracker)
 
-    mock_downstream = AsyncMock()
-    mock_downstream.set_handshake = MagicMock()
+    call_count = 0
 
-    # First two connect attempts fail, third succeeds.
-    init_response = make_initialize_response()
-    mock_downstream.connect = AsyncMock(
-        side_effect=[ConnectionError("down"), ConnectionError("still down"), None]
-    )
-    mock_downstream.send_request = AsyncMock(return_value=init_response)
-    mock_downstream.is_connected = True
+    async def fake_open_transport():
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise ConnectionError(f"attempt {call_count} failed")
+        mr, mw, inj, obs = _make_streams()
 
-    init_req = make_initialize_request()
-    await proxy._handle_initialize(
-        request=init_req,
-        write_stream=client_write,
-        downstream=mock_downstream,
-    )
+        async def respond():
+            sm = await obs.receive()
+            await inj.send(session(resp(id=sm.message.id, result={
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "s", "version": "0.1"},
+            })))
+            await obs.receive()  # initialized
 
-    # Eventually the response makes it to the client.
-    with anyio.fail_after(5):
-        sm: SessionMessage = await observe.receive()
-    assert isinstance(sm.message, types.JSONRPCResponse)
-    assert mock_downstream.connect.await_count == 3
+        asyncio.create_task(respond())
+        return mr, mw
+
+    from unittest.mock import patch as _patch
+    with _patch.object(mgr, "_open_transport", side_effect=fake_open_transport):
+        init_req = make_initialize_request()
+        response = await asyncio.wait_for(mgr.initial_connect(init_req), timeout=5)
+
+    assert isinstance(response, types.JSONRPCResponse)
+    assert call_count == 3
+    assert mgr.is_connected is True
