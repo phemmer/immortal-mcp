@@ -15,7 +15,7 @@ import pytest
 from mcp.shared.message import SessionMessage
 
 from immortal_mcp.cli import BackoffConfig, Config, IdleConfig
-from immortal_mcp.downstream import INFLIGHT_DISCONNECT_ERROR_MESSAGE
+from immortal_mcp.downstream import INFLIGHT_DISCONNECT_ERROR_MESSAGE, unwrap_message
 from immortal_mcp.idle import ActivitySource
 from immortal_mcp.proxy import ProxyServer, _METHOD_INITIALIZE, _METHOD_INITIALIZED, _METHOD_PING
 
@@ -91,20 +91,23 @@ async def test_initialize_connects_downstream_and_returns_response():
 
     with anyio.fail_after(5):
         sm: SessionMessage = await observe.receive()
-    assert isinstance(sm.message, types.JSONRPCResponse)
-    assert sm.message.id == init_req.id
-    # Capabilities should have been injected.
-    caps = sm.message.result.get("capabilities", {})
+    assert isinstance(unwrap_message(sm), types.JSONRPCResponse)
+    assert unwrap_message(sm).id == init_req.id
+    # listChanged should be injected only for capabilities the downstream supports.
+    caps = unwrap_message(sm).result.get("capabilities", {})
     assert caps.get("tools", {}).get("listChanged") is True
-    assert caps.get("prompts", {}).get("listChanged") is True
 
 
-async def test_initialized_notification_forwarded_to_downstream():
-    """The `notifications/initialized` notification is forwarded to downstream."""
+async def test_initialized_notification_not_forwarded_to_downstream():
+    """The client's `notifications/initialized` must not be forwarded to downstream.
+
+    The proxy sends its own notifications/initialized to the downstream during
+    initial_connect().  Forwarding the client's copy as well would cause the
+    downstream to receive the notification twice.
+    """
     proxy = ProxyServer(_make_config())
     mock_downstream = AsyncMock()
     mock_downstream.send_notification = AsyncMock()
-    mock_downstream.set_handshake = MagicMock()
 
     initialized = make_initialized_notification()
     await proxy._handle_initialized(
@@ -112,7 +115,7 @@ async def test_initialized_notification_forwarded_to_downstream():
         downstream=mock_downstream,
     )
 
-    mock_downstream.send_notification.assert_awaited_once_with(initialized)
+    mock_downstream.send_notification.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +140,7 @@ async def test_request_forwarded_and_response_returned():
 
     with anyio.fail_after(5):
         sm: SessionMessage = await observe.receive()
-    assert sm.message == expected_response
+    assert unwrap_message(sm) == expected_response
 
 
 async def test_disconnect_error_sent_to_client():
@@ -161,8 +164,8 @@ async def test_disconnect_error_sent_to_client():
 
     with anyio.fail_after(5):
         sm: SessionMessage = await observe.receive()
-    assert isinstance(sm.message, types.JSONRPCError)
-    assert INFLIGHT_DISCONNECT_ERROR_MESSAGE in sm.message.error.message
+    assert isinstance(unwrap_message(sm), types.JSONRPCError)
+    assert INFLIGHT_DISCONNECT_ERROR_MESSAGE in unwrap_message(sm).error.message
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +184,8 @@ async def test_downstream_notification_forwarded_to_client():
 
     with anyio.fail_after(5):
         sm: SessionMessage = await observe.receive()
-    assert isinstance(sm.message, types.JSONRPCNotification)
-    assert sm.message.method == "notifications/tools/list_changed"
+    assert isinstance(unwrap_message(sm), types.JSONRPCNotification)
+    assert unwrap_message(sm).method == "notifications/tools/list_changed"
 
 
 # ---------------------------------------------------------------------------
@@ -236,13 +239,78 @@ def test_downstream_ping_does_not_record_activity():
     # The actual behaviour is tested via the idle tracker integration.
 
 
+async def test_idle_disconnect_sends_inactivity_notification():
+    """When the idle timer fires, the proxy must send a 'disconnected due to
+    inactivity' notification to the client and disconnect the downstream."""
+    config = _make_config()
+    proxy = ProxyServer(config)
+
+    _, client_write, _, observe = _make_streams()
+
+    mock_downstream = AsyncMock()
+    mock_downstream.is_connected = True
+    mock_downstream.disconnect = AsyncMock()
+
+    notification_handler = proxy._make_notification_handler(client_write)
+    proxy._downstream = mock_downstream
+
+    # Simulate what the idle callback does.
+    proxy._on_idle(notification_handler)
+
+    # The notification should be sent synchronously.
+    with anyio.fail_after(1):
+        sm: SessionMessage = await observe.receive()
+    msg = unwrap_message(sm)
+    assert isinstance(msg, types.JSONRPCNotification)
+    assert msg.method == "notifications/message"
+    assert "inactivity" in msg.params["data"]
+
+    # disconnect() should have been scheduled.
+    await asyncio.sleep(0)  # let the scheduled future run
+    mock_downstream.disconnect.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# Invalid input handling
+# ---------------------------------------------------------------------------
+
+
+async def test_parse_error_produces_error_response():
+    """When the read stream delivers an Exception (parse error), an error
+    response must appear on the write stream — not silence."""
+    proxy = ProxyServer(_make_config())
+    client_read, client_write, inject, observe = _make_streams()
+
+    mock_downstream = AsyncMock()
+    mock_downstream.is_connected = False
+
+    # Send a parse error (what stdio_server produces for invalid JSON-RPC).
+    await inject.send(ValueError("Invalid JSON-RPC message"))
+    await inject.aclose()
+
+    await proxy._handle_client_messages(
+        read_stream=client_read,
+        write_stream=client_write,
+        downstream=mock_downstream,
+        idle_tracker=MagicMock(enabled=False),
+    )
+
+    # There should be an error response on the write stream.
+    with anyio.fail_after(1):
+        sm: SessionMessage = await observe.receive()
+    msg = unwrap_message(sm)
+    assert isinstance(msg, types.JSONRPCError), (
+        f"Expected JSONRPCError for parse error, got {type(msg).__name__}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Capability injection
 # ---------------------------------------------------------------------------
 
 
-def test_inject_capabilities_adds_list_changed():
-    """_inject_capabilities adds listChanged=true for tools, prompts, resources."""
+def test_inject_capabilities_adds_list_changed_only_for_supported():
+    """_inject_capabilities adds listChanged=true only for capabilities the downstream supports."""
     result = {
         "protocolVersion": "2024-11-05",
         "capabilities": {"tools": {}},
@@ -251,8 +319,8 @@ def test_inject_capabilities_adds_list_changed():
     ProxyServer._inject_capabilities(result)
     caps = result["capabilities"]
     assert caps["tools"]["listChanged"] is True
-    assert caps["prompts"]["listChanged"] is True
-    assert caps["resources"]["listChanged"] is True
+    assert "prompts" not in caps
+    assert "resources" not in caps
 
 
 def test_inject_capabilities_preserves_existing():
@@ -290,6 +358,54 @@ def test_is_unsupported_list_method_true_when_absent():
     assert proxy._is_unsupported_list_method("tools/list") in (True, False)
 
 
+async def test_initialize_response_only_includes_downstream_capabilities():
+    """The proxy must not advertise capabilities the downstream does not support.
+
+    When the downstream only supports tools, the response to the client must
+    not include prompts or resources capabilities.  Advertising unsupported
+    capabilities causes the client to send requests (prompts/list,
+    resources/list) for features the backend cannot handle.
+    """
+    config = _make_config()
+    proxy = ProxyServer(config)
+
+    client_read, client_write, inject, observe = _make_streams()
+
+    mock_downstream = AsyncMock()
+    mock_downstream.is_connected = False
+    # Downstream only supports tools — no prompts or resources.
+    init_response = resp(id=1, result={
+        "protocolVersion": "2024-11-05",
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+    })
+    mock_downstream.initial_connect = AsyncMock(return_value=init_response)
+    mock_downstream.downstream_capabilities = {"tools": {}}
+
+    init_req = make_initialize_request()
+    await inject.send(session(init_req))
+    await inject.aclose()
+
+    await proxy._handle_client_messages(
+        read_stream=client_read,
+        write_stream=client_write,
+        downstream=mock_downstream,
+        idle_tracker=MagicMock(enabled=False),
+    )
+
+    with anyio.fail_after(5):
+        sm: SessionMessage = await observe.receive()
+    caps = unwrap_message(sm).result.get("capabilities", {})
+    assert "tools" in caps, "tools capability should be present"
+    assert caps["tools"].get("listChanged") is True
+    assert "prompts" not in caps, (
+        "Proxy must not advertise prompts capability when downstream does not support it"
+    )
+    assert "resources" not in caps, (
+        "Proxy must not advertise resources capability when downstream does not support it"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Initialize retry on backend unavailable
 # ---------------------------------------------------------------------------
@@ -319,7 +435,7 @@ async def test_initialize_retries_until_backend_available():
 
         async def respond():
             sm = await obs.receive()
-            await inj.send(session(resp(id=sm.message.id, result={
+            await inj.send(session(resp(id=unwrap_message(sm).id, result={
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "s", "version": "0.1"},

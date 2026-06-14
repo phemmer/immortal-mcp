@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "A resilient MCP proxy that transparently wraps another MCP server with automatic reconnection"
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp>=3.2.0",
+    "mcp>=1.0.0",
 ]
 
 [project.scripts]

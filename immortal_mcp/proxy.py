@@ -19,7 +19,7 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
 
 from .cli import Config
-from .downstream import DownstreamManager
+from .downstream import DownstreamManager, unwrap_message, wrap_message
 from .idle import ActivitySource, IdleTracker
 
 logger = logging.getLogger(__name__)
@@ -59,14 +59,12 @@ class ProxyServer:
     async def run(self) -> None:
         """Run the proxy until the client disconnects or a fatal error occurs."""
         async with stdio_server() as (read_stream, write_stream):
+            notification_handler = self._make_notification_handler(write_stream)
             idle_tracker = IdleTracker(
                 timeout=self._config.idle.timeout,
                 client_only=self._config.idle.client_only,
-                on_idle=lambda: asyncio.get_event_loop().call_soon(
-                    lambda: asyncio.ensure_future(self._downstream.disconnect())
-                ),
+                on_idle=lambda: self._on_idle(notification_handler),
             )
-            notification_handler = self._make_notification_handler(write_stream)
             self._downstream = DownstreamManager(
                 config=self._config,
                 on_notification=notification_handler,
@@ -80,6 +78,9 @@ class ProxyServer:
             finally:
                 idle_tracker.stop()
                 await self._downstream.disconnect()
+                # Close the write stream so stdio_server's stdout_writer task
+                # unblocks and its task group can exit.
+                await write_stream.aclose()
 
     # ------------------------------------------------------------------
     # Client message handling
@@ -94,8 +95,16 @@ class ProxyServer:
     ) -> None:
         async for item in read_stream:
             if isinstance(item, Exception):
+                err = types.JSONRPCError.model_construct(
+                    jsonrpc="2.0",
+                    id=None,
+                    error=types.ErrorData(
+                        code=-32700, message=f"Parse error: {item}"
+                    ),
+                )
+                await write_stream.send(wrap_message(err))
                 continue
-            message = item.message
+            message = unwrap_message(item)
             self._record_client_activity(message, idle_tracker)
 
             if isinstance(message, types.JSONRPCRequest):
@@ -132,14 +141,17 @@ class ProxyServer:
             id=request.id,
             result=modified_result,
         )
-        await write_stream.send(SessionMessage(modified_response))
+        await write_stream.send(SessionMessage(types.JSONRPCMessage(modified_response)))
 
     async def _handle_initialized(
         self,
         notification: types.JSONRPCNotification,
         downstream: DownstreamManager,
     ) -> None:
-        await downstream.send_notification(notification)
+        # notifications/initialized was already sent to the downstream during
+        # initial_connect().  The client's copy is dropped to prevent a
+        # duplicate.
+        pass
 
     async def _forward_request(
         self,
@@ -149,10 +161,10 @@ class ProxyServer:
     ) -> None:
         if self._is_unsupported_list_method(request.method):
             response = self._empty_list_response(request.id, request.method)
-            await write_stream.send(SessionMessage(response))
+            await write_stream.send(SessionMessage(types.JSONRPCMessage(response)))
             return
         response = await downstream.send_request(request)
-        await write_stream.send(SessionMessage(response))
+        await write_stream.send(SessionMessage(types.JSONRPCMessage(response)))
 
     async def _forward_notification(
         self,
@@ -167,10 +179,10 @@ class ProxyServer:
 
     @staticmethod
     def _inject_capabilities(result: dict) -> dict:
-        caps = result.setdefault("capabilities", {})
+        caps = result.get("capabilities", {})
         for key in ("tools", "prompts", "resources"):
-            sub = caps.setdefault(key, {})
-            sub["listChanged"] = True
+            if key in caps:
+                caps[key]["listChanged"] = True
         return result
 
     def _is_unsupported_list_method(self, method: str) -> bool:
@@ -196,7 +208,7 @@ class ProxyServer:
     ) -> Callable[[types.JSONRPCNotification], None]:
         def handler(notification: types.JSONRPCNotification) -> None:
             try:
-                write_stream.send_nowait(SessionMessage(notification))
+                write_stream.send_nowait(SessionMessage(types.JSONRPCMessage(notification)))
             except (anyio.WouldBlock, anyio.ClosedResourceError):
                 pass
 
@@ -205,6 +217,23 @@ class ProxyServer:
     # ------------------------------------------------------------------
     # Idle tracking helpers
     # ------------------------------------------------------------------
+
+    def _on_idle(
+        self,
+        notification_handler: Callable[[types.JSONRPCNotification], None],
+    ) -> None:
+        notification_handler(
+            types.JSONRPCNotification(
+                method="notifications/message",
+                jsonrpc="2.0",
+                params={
+                    "level": "info",
+                    "logger": "immortal-mcp",
+                    "data": "Downstream server disconnected due to inactivity",
+                },
+            )
+        )
+        asyncio.ensure_future(self._downstream.disconnect())
 
     def _record_client_activity(
         self,

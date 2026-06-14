@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
@@ -48,6 +49,23 @@ INFLIGHT_DISCONNECT_ERROR_MESSAGE = (
 _METHOD_PING = "ping"
 
 _LOGGER_NAME = "immortal-mcp"
+
+
+def unwrap_message(session_msg: SessionMessage) -> types.JSONRPCRequest | types.JSONRPCResponse | types.JSONRPCNotification | types.JSONRPCError:
+    """Extract the concrete JSON-RPC message from a SessionMessage.
+
+    Real transports wrap messages in JSONRPCMessage (a pydantic RootModel).
+    This function handles both wrapped and unwrapped forms.
+    """
+    msg = session_msg.message
+    if isinstance(msg, types.JSONRPCMessage):
+        return msg.root
+    return msg
+
+
+def wrap_message(msg: types.JSONRPCRequest | types.JSONRPCResponse | types.JSONRPCNotification | types.JSONRPCError) -> SessionMessage:
+    """Wrap a concrete JSON-RPC message in SessionMessage(JSONRPCMessage(...))."""
+    return SessionMessage(types.JSONRPCMessage(msg))
 
 
 @dataclass
@@ -147,12 +165,12 @@ class DownstreamManager:
                 await asyncio.sleep(delay)
             try:
                 read_stream, write_stream = await self._open_transport()
-                await write_stream.send(SessionMessage(request))
+                await write_stream.send(SessionMessage(types.JSONRPCMessage(request)))
                 response: types.JSONRPCResponse | None = None
                 async for item in read_stream:
                     if isinstance(item, Exception):
                         raise item
-                    msg = item.message
+                    msg = unwrap_message(item)
                     if isinstance(msg, (types.JSONRPCResponse, types.JSONRPCError)):
                         if msg.id == request.id:
                             if isinstance(msg, types.JSONRPCError):
@@ -170,7 +188,7 @@ class DownstreamManager:
                 initialized_notif = types.JSONRPCNotification(
                     method="notifications/initialized", jsonrpc="2.0"
                 )
-                await write_stream.send(SessionMessage(initialized_notif))
+                await write_stream.send(SessionMessage(types.JSONRPCMessage(initialized_notif)))
 
                 self.set_handshake(request, response, initialized_notif)
                 self._write_stream = write_stream
@@ -235,6 +253,15 @@ class DownstreamManager:
                 pass
             self._reconnect_task = None
 
+        # Grab and clear the transport stack before cancelling the reader task.
+        # The reader task's finally block also tries to close _transport_stack,
+        # but it runs in a different asyncio.Task than the one that entered the
+        # transport's cancel scopes, so anyio rejects the close.  By clearing
+        # the reference first, the reader task skips its close attempt, and we
+        # close the stack here in the correct task.
+        transport_stack = self._transport_stack
+        self._transport_stack = None
+
         if self._reader_task_handle is not None and not self._reader_task_handle.done():
             self._reader_task_handle.cancel()
             try:
@@ -246,18 +273,10 @@ class DownstreamManager:
         self._write_stream = None
         self._read_stream = None
 
-        if self._transport_stack is not None:
-            await self._transport_stack.aclose()
-            self._transport_stack = None
+        if transport_stack is not None:
+            await transport_stack.aclose()
 
         self._fail_pending_requests()
-
-        if self._was_connected:
-            self._on_notification(
-                _make_log_notification(
-                    "info", "Downstream server disconnected due to inactivity"
-                )
-            )
 
     @property
     def is_connected(self) -> bool:
@@ -291,7 +310,7 @@ class DownstreamManager:
         future: asyncio.Future[types.JSONRPCResponse | types.JSONRPCError] = loop.create_future()
         self._pending[request.id] = _PendingRequest(future=future)
         try:
-            await self._write_stream.send(SessionMessage(request))
+            await self._write_stream.send(SessionMessage(types.JSONRPCMessage(request)))
         except (anyio.ClosedResourceError, anyio.BrokenResourceError):
             self._pending.pop(request.id, None)
             if not future.done():
@@ -302,7 +321,7 @@ class DownstreamManager:
         if not self.is_connected:
             return
         try:
-            await self._write_stream.send(SessionMessage(notification))
+            await self._write_stream.send(SessionMessage(types.JSONRPCMessage(notification)))
         except (anyio.ClosedResourceError, anyio.BrokenResourceError):
             pass
 
@@ -323,6 +342,7 @@ class DownstreamManager:
                 params = StdioServerParameters(
                     command=self._config.command[0],
                     args=self._config.command[1:],
+                    env=dict(os.environ),
                 )
                 read_stream, write_stream = await stack.enter_async_context(
                     stdio_client(params)
@@ -361,12 +381,12 @@ class DownstreamManager:
             id="proxy-init",
             jsonrpc="2.0",
         )
-        await write_stream.send(SessionMessage(proxy_init))
+        await write_stream.send(SessionMessage(types.JSONRPCMessage(proxy_init)))
 
         async for item in read_stream:
             if isinstance(item, Exception):
                 raise item
-            msg = item.message
+            msg = unwrap_message(item)
             if isinstance(msg, (types.JSONRPCResponse, types.JSONRPCError)) and msg.id == "proxy-init":
                 if isinstance(msg, types.JSONRPCError):
                     raise RuntimeError(f"Downstream initialize failed: {msg.error.message}")
@@ -374,7 +394,7 @@ class DownstreamManager:
                 self.downstream_capabilities = result.get("capabilities", {})
                 break
 
-        await write_stream.send(SessionMessage(initialized_notif))
+        await write_stream.send(SessionMessage(types.JSONRPCMessage(initialized_notif)))
 
     async def _reader_task(
         self,
@@ -385,7 +405,7 @@ class DownstreamManager:
                 if isinstance(item, Exception):
                     raise item
 
-                msg = item.message
+                msg = unwrap_message(item)
 
                 if hasattr(msg, "method") and getattr(msg, "method", None) != _METHOD_PING:
                     from .idle import ActivitySource

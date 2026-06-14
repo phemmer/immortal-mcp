@@ -11,7 +11,7 @@ import pytest
 from mcp.shared.message import SessionMessage
 
 from immortal_mcp.cli import BackoffConfig, Config, IdleConfig
-from immortal_mcp.downstream import INFLIGHT_DISCONNECT_ERROR_MESSAGE, NOT_CONNECTED_ERROR_MESSAGE, DownstreamManager
+from immortal_mcp.downstream import INFLIGHT_DISCONNECT_ERROR_MESSAGE, NOT_CONNECTED_ERROR_MESSAGE, DownstreamManager, unwrap_message
 from immortal_mcp.idle import IdleTracker
 
 from .conftest import (
@@ -23,6 +23,11 @@ from .conftest import (
     resp,
     session,
 )
+
+
+def _sm(msg: types.JSONRPCRequest | types.JSONRPCResponse | types.JSONRPCNotification | types.JSONRPCError) -> SessionMessage:
+    """Wrap a message like a real transport would (JSONRPCMessage wrapper)."""
+    return SessionMessage(types.JSONRPCMessage(msg))
 
 
 # ---------------------------------------------------------------------------
@@ -161,10 +166,10 @@ async def test_connect_marks_connected():
         async def reply_to_handshake():
             # Read the initialize request the manager sends.
             sm: SessionMessage = await observe.receive()
-            init_req: types.JSONRPCRequest = sm.message
+            init_req: types.JSONRPCRequest = unwrap_message(sm)
             # Send back a fake response with the same id.
             reply = types.JSONRPCResponse(id=init_req.id, result={}, jsonrpc="2.0")
-            await inject.send(SessionMessage(reply))
+            await inject.send(_sm(reply))
 
         with anyio.fail_after(5):
             async with anyio.create_task_group() as tg:
@@ -190,9 +195,9 @@ async def test_disconnect_marks_disconnected():
     with patch.object(mgr, "_open_transport", side_effect=fake_open_transport):
         async def reply_to_handshake():
             sm: SessionMessage = await observe.receive()
-            init_req: types.JSONRPCRequest = sm.message
+            init_req: types.JSONRPCRequest = unwrap_message(sm)
             reply = types.JSONRPCResponse(id=init_req.id, result={}, jsonrpc="2.0")
-            await inject.send(SessionMessage(reply))
+            await inject.send(_sm(reply))
 
         with anyio.fail_after(5):
             async with anyio.create_task_group() as tg:
@@ -232,16 +237,16 @@ async def test_send_request_when_disconnected_on_demand_connects_first():
         async def server_side():
             # 1. Reply to the handshake initialize.
             sm: SessionMessage = await observe.receive()
-            init_req: types.JSONRPCRequest = sm.message
-            await inject.send(SessionMessage(
+            init_req: types.JSONRPCRequest = unwrap_message(sm)
+            await inject.send(_sm(
                 types.JSONRPCResponse(id=init_req.id, result={}, jsonrpc="2.0")
             ))
             # 2. Read the initialized notification (no reply needed).
             await observe.receive()
             # 3. Read the forwarded request and reply.
             sm2: SessionMessage = await observe.receive()
-            fwd_req: types.JSONRPCRequest = sm2.message
-            await inject.send(SessionMessage(
+            fwd_req: types.JSONRPCRequest = unwrap_message(sm2)
+            await inject.send(_sm(
                 types.JSONRPCResponse(id=fwd_req.id, result={"ok": True}, jsonrpc="2.0")
             ))
 
@@ -314,8 +319,8 @@ async def test_ping_forwarded_when_connected():
     with patch.object(mgr, "_open_transport", side_effect=fake_open_transport):
         async def handshake():
             sm: SessionMessage = await observe.receive()
-            await inject.send(SessionMessage(
-                types.JSONRPCResponse(id=sm.message.id, result={}, jsonrpc="2.0")
+            await inject.send(_sm(
+                types.JSONRPCResponse(id=unwrap_message(sm).id, result={}, jsonrpc="2.0")
             ))
             await observe.receive()  # initialized
 
@@ -329,9 +334,9 @@ async def test_ping_forwarded_when_connected():
     # Send a ping while connected — it should be forwarded to downstream.
     async def downstream_replies_to_ping():
         sm: SessionMessage = await observe.receive()
-        assert sm.message.method == "ping"
-        await inject.send(SessionMessage(
-            types.JSONRPCResponse(id=sm.message.id, result={}, jsonrpc="2.0")
+        assert unwrap_message(sm).method == "ping"
+        await inject.send(_sm(
+            types.JSONRPCResponse(id=unwrap_message(sm).id, result={}, jsonrpc="2.0")
         ))
 
     with anyio.fail_after(5):
@@ -370,8 +375,8 @@ async def test_inflight_requests_failed_on_disconnect():
         # Connect and complete handshake.
         async def reply_handshake():
             sm: SessionMessage = await observe.receive()
-            init_req: types.JSONRPCRequest = sm.message
-            await inject.send(SessionMessage(
+            init_req: types.JSONRPCRequest = unwrap_message(sm)
+            await inject.send(_sm(
                 types.JSONRPCResponse(id=init_req.id, result={}, jsonrpc="2.0")
             ))
             await observe.receive()  # initialized notification
@@ -427,12 +432,12 @@ async def test_downstream_notifications_forwarded():
     with patch.object(mgr, "_open_transport", side_effect=fake_open_transport):
         async def server_side():
             sm: SessionMessage = await observe.receive()
-            init_req: types.JSONRPCRequest = sm.message
-            await inject.send(SessionMessage(
+            init_req: types.JSONRPCRequest = unwrap_message(sm)
+            await inject.send(_sm(
                 types.JSONRPCResponse(id=init_req.id, result={}, jsonrpc="2.0")
             ))
             await observe.receive()  # initialized
-            await inject.send(SessionMessage(notif("notifications/tools/list_changed")))
+            await inject.send(_sm(notif("notifications/tools/list_changed")))
             # Keep stream open until the notification is observed, then close.
             await notification_received.wait()
             await inject.aclose()
@@ -458,8 +463,17 @@ async def test_send_notification_dropped_when_disconnected():
 # ---------------------------------------------------------------------------
 
 
-async def test_idle_disconnect_sends_info_notification():
-    """An explicit disconnect() (e.g. idle timeout) sends an info notification."""
+async def test_disconnect_does_not_send_notification():
+    """disconnect() must not send any notification on its own.
+
+    Notifications about why the disconnect happened are the responsibility of
+    the code that initiated the disconnect:
+    - Idle timeout: proxy sends "disconnected due to inactivity" before calling disconnect()
+    - Backend crash: _reader_task sends "connection lost" on stream end
+    - Proxy shutdown: no notification needed (client is gone)
+
+    disconnect() itself must be silent.
+    """
     notifications: list[types.JSONRPCNotification] = []
 
     def on_notification(n: types.JSONRPCNotification) -> None:
@@ -479,8 +493,8 @@ async def test_idle_disconnect_sends_info_notification():
     with patch.object(mgr, "_open_transport", side_effect=fake_open_transport):
         async def server_side():
             sm: SessionMessage = await observe.receive()
-            await inject.send(SessionMessage(
-                types.JSONRPCResponse(id=sm.message.id, result={}, jsonrpc="2.0")
+            await inject.send(_sm(
+                types.JSONRPCResponse(id=unwrap_message(sm).id, result={}, jsonrpc="2.0")
             ))
             await observe.receive()  # initialized
 
@@ -489,12 +503,13 @@ async def test_idle_disconnect_sends_info_notification():
                 tg.start_soon(mgr.connect)
                 tg.start_soon(server_side)
 
-    # Now explicitly disconnect (simulates idle timeout).
     await mgr.disconnect()
 
     msg_notifications = [n for n in notifications if n.method == "notifications/message"]
-    assert len(msg_notifications) >= 1
-    assert msg_notifications[0].params["level"] == "info"
+    assert msg_notifications == [], (
+        f"disconnect() should not send notifications, but sent: "
+        f"{[n.params for n in msg_notifications]}"
+    )
 
 
 async def test_disconnect_notification_sent_on_unexpected_disconnect():
@@ -521,8 +536,8 @@ async def test_disconnect_notification_sent_on_unexpected_disconnect():
     with patch.object(mgr, "_open_transport", side_effect=fake_open_transport):
         async def server_side():
             sm: SessionMessage = await observe.receive()
-            await inject.send(SessionMessage(
-                types.JSONRPCResponse(id=sm.message.id, result={}, jsonrpc="2.0")
+            await inject.send(_sm(
+                types.JSONRPCResponse(id=unwrap_message(sm).id, result={}, jsonrpc="2.0")
             ))
             await observe.receive()  # initialized
             # Simulate crash by closing the stream.
@@ -581,8 +596,8 @@ async def test_reconnect_sends_list_changed_notifications():
 
     async def reply_to_handshake(inj, obs):
         sm: SessionMessage = await obs.receive()
-        await inj.send(SessionMessage(
-            types.JSONRPCResponse(id=sm.message.id, result={}, jsonrpc="2.0")
+        await inj.send(_sm(
+            types.JSONRPCResponse(id=unwrap_message(sm).id, result={}, jsonrpc="2.0")
         ))
         await obs.receive()  # initialized
 
@@ -633,7 +648,7 @@ async def test_downstream_capabilities_cached_from_handshake():
         async def server_side():
             sm: SessionMessage = await observe.receive()
             init_resp = types.JSONRPCResponse(
-                id=sm.message.id,
+                id=unwrap_message(sm).id,
                 result={
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"tools": {}, "resources": {"subscribe": True}},
@@ -641,7 +656,7 @@ async def test_downstream_capabilities_cached_from_handshake():
                 },
                 jsonrpc="2.0",
             )
-            await inject.send(SessionMessage(init_resp))
+            await inject.send(_sm(init_resp))
             await observe.receive()  # initialized
 
         with anyio.fail_after(5):

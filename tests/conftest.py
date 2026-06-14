@@ -41,9 +41,9 @@ def notif(method: str, params: dict | None = None) -> types.JSONRPCNotification:
     return types.JSONRPCNotification(method=method, params=params, jsonrpc="2.0")
 
 
-def session(msg: types.JSONRPCMessage) -> SessionMessage:
-    """Wrap a JSONRPCMessage in a SessionMessage."""
-    return SessionMessage(msg)
+def session(msg: types.JSONRPCRequest | types.JSONRPCResponse | types.JSONRPCNotification | types.JSONRPCError) -> SessionMessage:
+    """Wrap a message in JSONRPCMessage then SessionMessage, matching real transports."""
+    return SessionMessage(types.JSONRPCMessage(msg))
 
 
 def make_initialize_request() -> types.JSONRPCRequest:
