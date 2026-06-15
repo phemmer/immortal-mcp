@@ -86,3 +86,25 @@ Configure immortal-mcp in place of the original server command. For example, in 
   }
 }
 ```
+
+## Embedding as a library
+
+immortal-mcp can also be embedded directly, so a program can supervise its own downstream server
+from its entry point rather than declaring the wrapper in a client manifest. This keeps the
+supervision policy in code, next to the server it applies to.
+
+```python
+import sys
+from immortal_mcp import serve_stdio
+
+# Blocks until the client disconnects; respawns the downstream on crash.
+serve_stdio(
+    [sys.executable, "-m", "my_mcp_server"],
+    reconnect_immediately=True,
+)
+```
+
+`serve_stdio` is a thin wrapper over the same `Config` / `ProxyServer` the CLI uses. For more
+control, build the config yourself with `build_stdio_config(...)` (or construct `Config` directly)
+and run `ProxyServer(config).run()` on your own event loop. The options mirror the CLI flags
+documented above.
