@@ -439,6 +439,92 @@ async def test_downstream_receives_initialized_notification_exactly_once():
         await proc.wait()
 
 
+# ---------------------------------------------------------------------------
+# Channel passthrough: experimental capability + custom notification method
+# ---------------------------------------------------------------------------
+
+
+# A minimal "channel" server: declares an experimental capability and, once the
+# handshake completes, pushes an unsolicited notification with a custom method.
+# This mirrors how a Claude Code channel server (e.g. claude-channels) works, and
+# guards that the proxy neither strips experimental capabilities nor drops
+# notifications whose method it does not recognize.
+_CHANNEL_SERVER = r'''
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        resp = {
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"experimental": {"claude/channel": {}}, "tools": {}},
+                "serverInfo": {"name": "chan", "version": "0.1"},
+            },
+        }
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif msg.get("method") == "notifications/initialized":
+        note = {
+            "jsonrpc": "2.0",
+            "method": "notifications/claude/channel",
+            "params": {"content": "hello", "meta": {"id": "slack:C1:1.2"}},
+        }
+        sys.stdout.write(json.dumps(note) + "\n")
+        sys.stdout.flush()
+'''
+
+
+async def test_subprocess_preserves_experimental_capability_and_forwards_custom_notification():
+    """The proxy must pass an experimental capability through the initialize response unchanged and
+    forward a downstream notification whose method it does not recognize."""
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "immortal_mcp",
+        sys.executable, "-c", _CHANNEL_SERVER,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        proc.stdin.write((json.dumps(_INIT_REQUEST) + "\n").encode())
+        await proc.stdin.drain()
+        proc.stdin.write((json.dumps({
+            "jsonrpc": "2.0", "method": "notifications/initialized",
+        }) + "\n").encode())
+        await proc.stdin.drain()
+
+        # The init response and the pushed notification may arrive in either order
+        # (the proxy forwards the push as the reader task observes it), so scan.
+        capabilities = None
+        channel_note = None
+        for _ in range(6):
+            line = await asyncio.wait_for(proc.stdout.readline(), timeout=10.0)
+            if not line:
+                break
+            msg = json.loads(line)
+            if msg.get("id") == 1 and "result" in msg:
+                capabilities = msg["result"]["capabilities"]
+            if msg.get("method") == "notifications/claude/channel":
+                channel_note = msg
+            if capabilities is not None and channel_note is not None:
+                break
+
+        assert capabilities is not None, "no initialize response received"
+        assert capabilities.get("experimental", {}).get("claude/channel") == {}, (
+            f"experimental capability not preserved: {capabilities!r}"
+        )
+        assert channel_note is not None, "custom channel notification was not forwarded"
+        assert channel_note["params"]["meta"]["id"] == "slack:C1:1.2"
+    finally:
+        proc.kill()
+        await proc.wait()
+
+
 async def test_subprocess_inherits_environment_variables():
     """Environment variables set in the parent must be visible to the downstream server."""
     env = {**os.environ, "IMMORTAL_MCP_TEST_VAR": "passthrough-ok"}

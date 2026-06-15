@@ -174,16 +174,24 @@ async def test_disconnect_error_sent_to_client():
 
 
 async def test_downstream_notification_forwarded_to_client():
-    """Notifications from downstream are forwarded to the client write stream."""
+    """Notifications from downstream are queued and forwarded to the client by the outbound pump."""
     proxy = ProxyServer(_make_config())
     _, client_write, _, observe = _make_streams()
+    proxy._outbound = asyncio.Queue()
 
-    handler = proxy._make_notification_handler(client_write)
-    tools_changed = notif("notifications/tools/list_changed")
-    handler(tools_changed)
+    handler = proxy._make_notification_handler()
+    handler(notif("notifications/tools/list_changed"))
 
-    with anyio.fail_after(5):
-        sm: SessionMessage = await observe.receive()
+    pump = asyncio.create_task(proxy._drain_outbound(client_write))
+    try:
+        with anyio.fail_after(5):
+            sm: SessionMessage = await observe.receive()
+    finally:
+        pump.cancel()
+        try:
+            await pump
+        except asyncio.CancelledError:
+            pass
     assert isinstance(unwrap_message(sm), types.JSONRPCNotification)
     assert unwrap_message(sm).method == "notifications/tools/list_changed"
 
@@ -251,15 +259,23 @@ async def test_idle_disconnect_sends_inactivity_notification():
     mock_downstream.is_connected = True
     mock_downstream.disconnect = AsyncMock()
 
-    notification_handler = proxy._make_notification_handler(client_write)
+    proxy._outbound = asyncio.Queue()
+    notification_handler = proxy._make_notification_handler()
     proxy._downstream = mock_downstream
 
-    # Simulate what the idle callback does.
-    proxy._on_idle(notification_handler)
+    pump = asyncio.create_task(proxy._drain_outbound(client_write))
+    try:
+        # Simulate what the idle callback does.
+        proxy._on_idle(notification_handler)
 
-    # The notification should be sent synchronously.
-    with anyio.fail_after(1):
-        sm: SessionMessage = await observe.receive()
+        with anyio.fail_after(1):
+            sm: SessionMessage = await observe.receive()
+    finally:
+        pump.cancel()
+        try:
+            await pump
+        except asyncio.CancelledError:
+            pass
     msg = unwrap_message(sm)
     assert isinstance(msg, types.JSONRPCNotification)
     assert msg.method == "notifications/message"

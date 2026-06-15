@@ -90,6 +90,10 @@ On reconnect, the proxy also sends list invalidation notifications:
 
 Notifications are not sent during the initial `initialize` phase (before the client's `initialize` response is delivered).
 
+### Client-bound notification delivery
+
+All notifications destined for the client — both those forwarded from the downstream and those the proxy generates itself (status, list-invalidation) — are placed on an unbounded outbound queue (`ProxyServer._outbound`) and delivered by a single `_drain_outbound` task with an awaited `write_stream.send`. This matters because the client write stream from `stdio_server()` is unbuffered (zero capacity): a fire-and-forget `send_nowait` raises `WouldBlock` and silently drops the message whenever the stdout writer is not already parked in a receive, which is the normal case. Serializing through the queue also preserves notification order. Responses to client requests are still sent inline by the request handlers; the two are independent senders on the same stream.
+
 ## Idle tracking
 
 `IdleTracker` maintains `_last_activity_time` and runs a periodic check task. Activity is recorded by `ProxyServer` on each non-ping message. When `time.monotonic() - _last_activity_time >= timeout`, the on_idle callback is called synchronously (the callback schedules `downstream.disconnect()` via `asyncio.create_task`).

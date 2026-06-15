@@ -59,7 +59,8 @@ class ProxyServer:
     async def run(self) -> None:
         """Run the proxy until the client disconnects or a fatal error occurs."""
         async with stdio_server() as (read_stream, write_stream):
-            notification_handler = self._make_notification_handler(write_stream)
+            self._outbound: asyncio.Queue[SessionMessage] = asyncio.Queue()
+            notification_handler = self._make_notification_handler()
             idle_tracker = IdleTracker(
                 timeout=self._config.idle.timeout,
                 client_only=self._config.idle.client_only,
@@ -70,6 +71,7 @@ class ProxyServer:
                 on_notification=notification_handler,
                 idle_tracker=idle_tracker,
             )
+            outbound_task = asyncio.create_task(self._drain_outbound(write_stream))
             await idle_tracker.start()
             try:
                 await self._handle_client_messages(
@@ -78,6 +80,11 @@ class ProxyServer:
             finally:
                 idle_tracker.stop()
                 await self._downstream.disconnect()
+                outbound_task.cancel()
+                try:
+                    await outbound_task
+                except asyncio.CancelledError:
+                    pass
                 # Close the write stream so stdio_server's stdout_writer task
                 # unblocks and its task group can exit.
                 await write_stream.aclose()
@@ -204,15 +211,36 @@ class ProxyServer:
 
     def _make_notification_handler(
         self,
-        write_stream: MemoryObjectSendStream[SessionMessage],
     ) -> Callable[[types.JSONRPCNotification], None]:
+        """Build the callback that queues a client-bound notification.
+
+        The callback is synchronous so it can be invoked from both async contexts (the downstream
+        reader and reconnect paths) and sync ones (the idle timer). It only enqueues; the actual
+        send is performed by `_drain_outbound`. The queue is unbounded, so enqueuing never blocks
+        or drops — this is what makes server-initiated notifications reliable over the unbuffered
+        client stream, where a fire-and-forget `send_nowait` would silently drop them."""
+
         def handler(notification: types.JSONRPCNotification) -> None:
-            try:
-                write_stream.send_nowait(SessionMessage(types.JSONRPCMessage(notification)))
-            except (anyio.WouldBlock, anyio.ClosedResourceError):
-                pass
+            self._outbound.put_nowait(SessionMessage(types.JSONRPCMessage(notification)))
 
         return handler
+
+    async def _drain_outbound(
+        self,
+        write_stream: MemoryObjectSendStream[SessionMessage],
+    ) -> None:
+        """Forward queued client-bound notifications, each with an awaited send.
+
+        Serializing notifications through this single task preserves their order and guarantees
+        delivery on the unbuffered client stream (an awaited `send` waits for the writer to be
+        ready, unlike `send_nowait`). Responses are still sent inline by the request handlers; both
+        paths are independent senders on the same stream."""
+        try:
+            while True:
+                message = await self._outbound.get()
+                await write_stream.send(message)
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+            pass
 
     # ------------------------------------------------------------------
     # Idle tracking helpers
